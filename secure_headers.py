@@ -1,13 +1,13 @@
 import sys
-import urllib.request
-import urllib.error
-import urllib.parse
-import ssl
 import re
+import warnings
+
+# Suppress SSL warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 # Configuration
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-TIMEOUT_SECONDS = 10
+TIMEOUT_SECONDS = 15
 HSTS_MIN_AGE = 10368000 # 120 days
 
 # Security Check Configuration
@@ -20,22 +20,47 @@ SEC_HEADERS = {
 'Permissions-Policy': 'warning'
 }
 
-def normalize_url(target):
-    if not target.startswith(('http://', 'https://')):
-        return 'https://' + target
-    return target
+
+def get_urls_to_try(target):
+    """
+    Returns a list of URLs to try for a given target.
+    If target already has a scheme, use it as-is.
+    Otherwise, try HTTPS first, then fall back to HTTP.
+    """
+    if target.startswith(('http://', 'https://')):
+        return [target]
+    return ['https://' + target, 'http://' + target]
 
 def check_target(target):
-    target = normalize_url(target)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    headers = {'User-Agent': USER_AGENT}
+    """
+    Attempts to connect to the target using requests library.
+    Tries HTTPS first, then falls back to HTTP.
+    Returns (final_url, headers_dict) if successful, (None, None) otherwise.
+    """
     try:
-        req = urllib.request.Request(target, headers=headers)
-        return urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS, context=ctx)
-    except Exception:
-        return None
+        import requests
+    except ImportError:
+        print("Error: requests library not installed. Run: uv pip install requests")
+        sys.exit(1)
+    
+    headers = {'User-Agent': USER_AGENT}
+    urls_to_try = get_urls_to_try(target)
+    
+    for url in urls_to_try:
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=TIMEOUT_SECONDS,
+                verify=False,  # Disable SSL verification
+                allow_redirects=True
+            )
+            # Return the final URL and headers (case-insensitive)
+            return response.url, {k.lower(): v for k, v in response.headers.items()}
+        except Exception:
+            continue  # Try next URL (HTTP fallback)
+    
+    return None, None  # All attempts failed
 
 def validate_hsts(value):
     """
@@ -113,6 +138,7 @@ def validate_header(header_name, value):
             return True, f"bad value: {value}"
     return False, None
 
+
 def save_to_excel(results, filename):
     try:
         from openpyxl import Workbook
@@ -135,22 +161,29 @@ def save_to_excel(results, filename):
     
     # write Header Row
     headers_list = list(SEC_HEADERS.keys())
-    ws.append(["URL"] + headers_list)
+    ws.append(["Input Domain", "Final URL"] + headers_list)
     for cell in ws[1]:
         cell.font = header_font
         cell.alignment = center_aligned
         cell.border = thin_border
         
     row_idx = ws.max_row + 1
-    for url, data in results.items():
-        ws.cell(row=row_idx, column=1, value=url).border = thin_border
+    for input_domain, data in results.items():
+        final_url = data.get("final_url", input_domain)
+        ws.cell(row=row_idx, column=1, value=input_domain).border = thin_border
+        ws.cell(row=row_idx, column=2, value=final_url).border = thin_border
         present = data.get("present", {})
         missing = data.get("missing", [])
         
-        for col_idx, header_name in enumerate(headers_list, start=2):
+        for col_idx, header_name in enumerate(headers_list, start=3):
             cell_value = "N/A"
             cell_fill = None
-            if header_name in missing:
+            
+            # Check if this host failed to connect
+            if data.get("failed"):
+                cell_value = "Connection Failed"
+                # Leave cell_fill as None (no color) for failed connections
+            elif header_name in missing:
                 cell_value = "Missing"
                 cell_fill = fill_missing
             elif header_name in present:
@@ -215,7 +248,7 @@ def main():
         
     processed_count = 0
     for target in valid_targets:
-        response = check_target(target)
+        rUrl, headers = check_target(target)
         
         # Update progress
         if pbar:
@@ -225,13 +258,13 @@ def main():
             processed_count += 1
             print(f"[{processed_count}/{total_targets}] Scanning {target}...", end='\r')
             
-        if not response:
+        if rUrl is None:
+            # Include failed hosts in output with connection failed status
+            json_out[target] = {"final_url": target, "present": {}, "missing": [], "failed": True}
             continue
-            
-        rUrl = response.geturl()
-        headers = {k.lower(): v for k, v in response.getheaders()}
         
-        json_results = {"present": {}, "missing": []}
+        json_results = {"final_url": rUrl, "present": {}, "missing": []}
+            
         for header_name in SEC_HEADERS:
             header_lower = header_name.lower()
             if header_lower in headers:
@@ -242,7 +275,7 @@ def main():
                     continue
                 json_results["missing"].append(header_name)
         
-        json_out[rUrl] = json_results
+        json_out[target] = json_results
         
     if pbar:
         pbar.close()
